@@ -131,6 +131,7 @@
                 <button class="btn" id="btn-start">Start</button>
                 <button class="btn stop" id="btn-stop" disabled>Stop</button>
                 <button class="btn" id="btn-monitor">Monitor: off (use headphones)</button>
+                <button class="btn active" id="btn-denoise">Denoise: on</button>
             </div>
         </div>
 
@@ -182,6 +183,10 @@
                     <div class="stat-val" id="rms-val">—</div>
                     <div class="stat-label">Last RMS</div>
                 </div>
+                <div class="stat">
+                    <div class="stat-val" id="vad-val">—</div>
+                    <div class="stat-label">Voice probability</div>
+                </div>
             </div>
         </div>
 
@@ -228,6 +233,7 @@ let animFrame = null;
 let chunks   = 0;
 let currentMode = 'passthrough';
 let monitorOn = false;
+let denoiseOn = true;
 
 function log(msg, kind = 'info') {
     const ts  = new Date().toLocaleTimeString('en', { hour12: false });
@@ -255,6 +261,7 @@ btnStart.addEventListener('click', async () => {
             gain:          parseFloat(document.getElementById('gain').value),
             chunkDuration: parseInt(document.getElementById('chunk-dur').value),
             monitor:       monitorOn,
+            denoise:       denoiseOn ? 1 : 0,   // always enabled so the A/B toggle is instant
             onChunk: (samples) => {
                 chunks++;
                 chunkCount.textContent = chunks;
@@ -291,6 +298,7 @@ btnStop.addEventListener('click', () => {
     chunks = 0;
     chunkCount.textContent = '0';
     rmsEl.textContent      = '—';
+    document.getElementById('vad-val').textContent = '—';
 
     setStatus('offline', 'idle');
     log('VoiceKernel destroyed', 'info');
@@ -310,6 +318,16 @@ btnMonitor.addEventListener('click', () => {
     btnMonitor.classList.toggle('active', monitorOn);
     if (mic) mic.setMonitor(monitorOn);
     log(`monitor → ${monitorOn ? 'on' : 'off'}`, 'ok');
+});
+
+// ── Denoise (A/B) ──────────────────────────────────────────────────────────
+const btnDenoise = document.getElementById('btn-denoise');
+btnDenoise.addEventListener('click', () => {
+    denoiseOn = !denoiseOn;
+    btnDenoise.textContent = denoiseOn ? 'Denoise: on' : 'Denoise: off';
+    btnDenoise.classList.toggle('active', denoiseOn);
+    if (mic) mic.setDenoise(denoiseOn ? 1 : 0);
+    log(`denoise → ${denoiseOn ? 'on' : 'off'}`, 'ok');
 });
 
 // ── Mode ───────────────────────────────────────────────────────────────────
@@ -358,6 +376,7 @@ function drawWaveform(analyser) {
     function draw() {
         animFrame = requestAnimationFrame(draw);
         analyser.getFloatTimeDomainData(buf);
+        if (mic) document.getElementById('vad-val').textContent = mic.voiceProbability.toFixed(2);
         ctx.clearRect(0, 0, W, H);
 
         ctx.strokeStyle = '#1a1a2e';

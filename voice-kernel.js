@@ -9,6 +9,7 @@
  *       gain: 1.0,
  *       chunkDuration: 250,
  *       monitor: false,          // play processed mic to speakers (use headphones!)
+ *       denoise: true,           // RNNoise: true/false, or a 0..1 amount (+20 ms latency)
  *       echoCancellation: false,
  *       noiseSuppression: false,
  *       autoGainControl: false,
@@ -17,6 +18,8 @@
  *
  *   peer.addTrack(mic.stream.getAudioTracks()[0])   // processed MediaStream
  *   mic.setGain(0.5)
+ *   mic.setDenoise(0.5)                             // only if created with denoise on
+ *   mic.voiceProbability                            // 0..1, from RNNoise
  *   mic.setMode('accumulate')
  *   mic.destroy()
  */
@@ -26,11 +29,15 @@ const WASM_PATH = new URL('./processor.wasm', import.meta.url).href;
 
 const READY_TIMEOUT_MS = 5000;
 
+const clamp01 = (v) => Math.max(0, Math.min(1, Number(v) || 0));
+
 class VoiceKernel {
 
     // private — use VoiceKernel.create() instead
     constructor({ audioCtx, micSource, workletNode, analyser, outputNode, inputStream,
-                  latencySamples, options }) {
+                  latencySamples, denoiseEnabled, live, options }) {
+        this._denoiseEnabled = denoiseEnabled;
+        this._live = live;            // values the worklet keeps updating (voice probability)
         this._audioCtx = audioCtx;
         this._micSource = micSource;
         this._workletNode = workletNode;
@@ -48,11 +55,16 @@ class VoiceKernel {
             gain = 1.0,
             chunkDuration = 250,
             monitor = false,
+            denoise = false,
             echoCancellation = false,
             noiseSuppression = false,
             autoGainControl = false,
             onChunk = null,
         } = options;
+
+        // denoise: true → full strength, number → that amount (0 keeps it ready but dry)
+        const denoiseEnabled = denoise === true || typeof denoise === 'number';
+        const denoiseAmount = typeof denoise === 'number' ? clamp01(denoise) : 1;
 
         // 1. mic access
         const inputStream = await navigator.mediaDevices.getUserMedia({
@@ -78,6 +90,8 @@ class VoiceKernel {
                     wasmBytes,
                     mode,
                     gain,
+                    denoiseEnabled,
+                    denoiseAmount,
                     sampleRate: audioCtx.sampleRate,
                     chunkDuration,
                 },
@@ -101,10 +115,12 @@ class VoiceKernel {
                 };
             });
 
+            const live = { voiceProbability: 0 };
             workletNode.port.onmessage = (e) => {
                 if (e.data.type === 'chunk' && onChunk) {
                     onChunk(new Float32Array(e.data.audio));
                 }
+                if (e.data.type === 'vad') live.voiceProbability = e.data.value;
             };
 
             // 7. wire audio graph
@@ -122,7 +138,7 @@ class VoiceKernel {
 
             const mic = new VoiceKernel({
                 audioCtx, micSource, workletNode, analyser, outputNode, inputStream,
-                latencySamples, options,
+                latencySamples, denoiseEnabled, live, options,
             });
             mic.setMonitor(monitor);
             return mic;
@@ -142,6 +158,25 @@ class VoiceKernel {
     /** Latency added by VoiceKernel's processing, in milliseconds (excludes browser I/O). */
     get latencyMs() {
         return this._audioCtx ? (this._latencySamples / this._audioCtx.sampleRate) * 1000 : 0;
+    }
+
+    /** Probability (0..1) that the latest 10 ms frame is speech. Needs denoise on. */
+    get voiceProbability() {
+        return this._live.voiceProbability;
+    }
+
+    /**
+     * Change how much noise suppression is applied, smoothly (no clicks).
+     * Only works if the instance was created with `denoise` on, since turning
+     * RNNoise on changes the latency.
+     * @param {number} amount - 0 (original audio) to 1 (fully denoised)
+     */
+    setDenoise(amount) {
+        if (!this._denoiseEnabled) {
+            console.warn('VoiceKernel: create with { denoise: true } (or a number) to use setDenoise()');
+            return;
+        }
+        this._workletNode.port.postMessage({ type: 'param', id: 1, value: clamp01(amount) });
     }
 
     /**

@@ -11,6 +11,10 @@ class AudioKernelProcessor extends AudioWorkletProcessor {
             (opts.sampleRate || 48000) * ((opts.chunkDuration || 250) / 1000)
         );
         this.gain = typeof opts.gain === 'number' ? opts.gain : 1.0;
+        this.denoiseEnabled = !!opts.denoiseEnabled;
+        this.denoiseAmount = typeof opts.denoiseAmount === 'number' ? opts.denoiseAmount : 1.0;
+        this.vadEvery = 8;            // post voice probability every 8 blocks (~21 ms)
+        this.blockCount = 0;
 
         this.exp = null;
         this.kernel = 0;
@@ -30,7 +34,12 @@ class AudioKernelProcessor extends AudioWorkletProcessor {
 
             this.exp = exp;
             this.kernel = exp.create_kernel();
+            if (exp.is_ready && !exp.is_ready(this.kernel)) {
+                throw new Error('RNNoise failed to initialise');
+            }
             exp.set_parameter(this.kernel, 0, this.gain);
+            exp.set_parameter(this.kernel, 2, this.denoiseEnabled ? 1 : 0);  // before any audio
+            exp.set_parameter(this.kernel, 1, this.denoiseAmount);
             this._attachViews();
             this.isReady = true;
 
@@ -45,9 +54,10 @@ class AudioKernelProcessor extends AudioWorkletProcessor {
         this.port.onmessage = (event) => {
             const { type, id, value, mode, chunkDuration, sampleRate } = event.data;
 
-            if (type === 'param' && id === 0) {
-                this.gain = value;
-                if (this.isReady) this.exp.set_parameter(this.kernel, 0, value);
+            if (type === 'param' && (id === 0 || id === 1)) {
+                if (id === 0) this.gain = value;
+                if (id === 1) this.denoiseAmount = value;
+                if (this.isReady) this.exp.set_parameter(this.kernel, id, value);
             }
 
             if (type === 'setMode') {
@@ -99,6 +109,11 @@ class AudioKernelProcessor extends AudioWorkletProcessor {
 
         if (this.mode === 'accumulate' || this.mode === 'both') {
             this._accumulate(this.outputView.subarray(0, input.length));
+        }
+
+        if (this.denoiseEnabled && this.exp.get_vad && ++this.blockCount >= this.vadEvery) {
+            this.blockCount = 0;
+            this.port.postMessage({ type: 'vad', value: this.exp.get_vad(this.kernel) });
         }
 
         return true;
