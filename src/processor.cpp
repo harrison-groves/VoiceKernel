@@ -18,11 +18,12 @@ constexpr int BLOCK = 128;
 constexpr int FRAME = 480;
 constexpr int GCD   = 32;                 // gcd(BLOCK, FRAME)
 constexpr int PRIME = FRAME - GCD;        // 448
-constexpr int RING  = 1024;               // power of two, > PRIME + FRAME + BLOCK
+constexpr int RING  = 1024;               // power of two, >= PRIME + BLOCK (peak fill)
 constexpr int RING_MASK = RING - 1;
 
 static_assert(FRAME % GCD == 0 && BLOCK % GCD == 0, "GCD must divide both sizes");
-static_assert(RING > PRIME + FRAME + BLOCK, "output ring too small");
+// Before each read the queue holds at most PRIME + BLOCK samples (576).
+static_assert(RING >= PRIME + BLOCK, "output ring too small");
 
 class AudioKernel {
 public:
