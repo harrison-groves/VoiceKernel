@@ -130,6 +130,7 @@
             <div class="col">
                 <button class="btn" id="btn-start">Start</button>
                 <button class="btn stop" id="btn-stop" disabled>Stop</button>
+                <button class="btn" id="btn-monitor">Monitor: off (use headphones)</button>
             </div>
         </div>
 
@@ -226,6 +227,7 @@ let mic      = null;
 let animFrame = null;
 let chunks   = 0;
 let currentMode = 'passthrough';
+let monitorOn = false;
 
 function log(msg, kind = 'info') {
     const ts  = new Date().toLocaleTimeString('en', { hour12: false });
@@ -252,6 +254,7 @@ btnStart.addEventListener('click', async () => {
             mode:          currentMode,
             gain:          parseFloat(document.getElementById('gain').value),
             chunkDuration: parseInt(document.getElementById('chunk-dur').value),
+            monitor:       monitorOn,
             onChunk: (samples) => {
                 chunks++;
                 chunkCount.textContent = chunks;
@@ -264,7 +267,7 @@ btnStart.addEventListener('click', async () => {
             }
         });
 
-        log('VoiceKernel ready', 'ok');
+        log(`VoiceKernel ready — WASM kernel running, +${mic.latencyMs.toFixed(2)} ms processing latency`, 'ok');
         setStatus('active', 'on');
 
         // wire analyser for waveform
@@ -297,6 +300,16 @@ btnStop.addEventListener('click', () => {
 
     const c = document.getElementById('waveform');
     c.getContext('2d').clearRect(0, 0, c.width, c.height);
+});
+
+// ── Monitor ────────────────────────────────────────────────────────────────
+const btnMonitor = document.getElementById('btn-monitor');
+btnMonitor.addEventListener('click', () => {
+    monitorOn = !monitorOn;
+    btnMonitor.textContent = monitorOn ? 'Monitor: on' : 'Monitor: off (use headphones)';
+    btnMonitor.classList.toggle('active', monitorOn);
+    if (mic) mic.setMonitor(monitorOn);
+    log(`monitor → ${monitorOn ? 'on' : 'off'}`, 'ok');
 });
 
 // ── Mode ───────────────────────────────────────────────────────────────────

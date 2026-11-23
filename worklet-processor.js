@@ -1,3 +1,5 @@
+const BLOCK = 128;
+
 class AudioKernelProcessor extends AudioWorkletProcessor {
     constructor(options) {
         super();
@@ -8,44 +10,50 @@ class AudioKernelProcessor extends AudioWorkletProcessor {
         this.chunkSize = Math.floor(
             (opts.sampleRate || 48000) * ((opts.chunkDuration || 250) / 1000)
         );
+        this.gain = typeof opts.gain === 'number' ? opts.gain : 1.0;
 
-        this.instance = null;
-        this.cppInstancePtr = null;
-        this.inPtr = null;
-        this.outPtr = null;
+        this.exp = null;
+        this.kernel = 0;
         this.inputView = null;
         this.outputView = null;
         this.isReady = false;
 
-        // gain handled in JS — reliable across all browsers
-        this.gain = 1.0;
-
         this.accumulator = new Float32Array(this.chunkSize);
         this.accumulatorIndex = 0;
 
-        WebAssembly.instantiate(opts.wasmBytes).then(result => {
-            this.instance = result.instance;
-            const exp = this.instance.exports;
+        // Stub imports so an older build (with ALLOW_MEMORY_GROWTH) still loads.
+        const imports = { env: { emscripten_notify_memory_growth: () => {} } };
 
-            this.cppInstancePtr = exp.create_kernel();
-            this.inPtr = exp.get_input_ptr();
-            this.outPtr = exp.get_output_ptr();
+        WebAssembly.instantiate(opts.wasmBytes, imports).then(({ instance }) => {
+            const exp = instance.exports;
+            if (exp._initialize) exp._initialize();   // run C++ static initialisers
 
-            this.inputView = new Float32Array(exp.memory.buffer, this.inPtr, 128);
-            this.outputView = new Float32Array(exp.memory.buffer, this.outPtr, 128);
-
+            this.exp = exp;
+            this.kernel = exp.create_kernel();
+            exp.set_parameter(this.kernel, 0, this.gain);
+            this._attachViews();
             this.isReady = true;
+
+            const latencySamples = exp.get_latency_samples
+                ? exp.get_latency_samples(this.kernel)
+                : 0;
+            this.port.postMessage({ type: 'ready', latencySamples });
+        }).catch((err) => {
+            this.port.postMessage({ type: 'error', message: String(err && err.message || err) });
         });
 
         this.port.onmessage = (event) => {
             const { type, id, value, mode, chunkDuration, sampleRate } = event.data;
 
-            if (type === 'param') {
-                // gain applied in JS so it works regardless of WASM export issues
-                if (id === 0) this.gain = value;
+            if (type === 'param' && id === 0) {
+                this.gain = value;
+                if (this.isReady) this.exp.set_parameter(this.kernel, 0, value);
             }
 
             if (type === 'setMode') {
+                if (this.accumulatorIndex > 0 && this.mode !== 'passthrough') {
+                    this._postChunk(this.accumulatorIndex);   // don't drop a partial chunk
+                }
                 this.mode = mode;
                 this.accumulatorIndex = 0;
                 if (chunkDuration && sampleRate) {
@@ -53,85 +61,69 @@ class AudioKernelProcessor extends AudioWorkletProcessor {
                     this.accumulator = new Float32Array(this.chunkSize);
                 }
             }
+
+            if (type === 'stats' && this.isReady && this.exp.get_underrun_count) {
+                this.port.postMessage({
+                    type: 'stats',
+                    underruns: this.exp.get_underrun_count(this.kernel),
+                });
+            }
         };
+    }
+
+    _attachViews() {
+        const buf = this.exp.memory.buffer;
+        this.inputView = new Float32Array(buf, this.exp.get_input_ptr(), BLOCK);
+        this.outputView = new Float32Array(buf, this.exp.get_output_ptr(), BLOCK);
     }
 
     process(inputs, outputs) {
         const input = inputs[0][0];
-        const outputChannels = outputs[0];
+        const out = outputs[0];
 
-        if (!input || !outputChannels[0]) return true;
+        if (!input || !out[0]) return true;
 
-        // bypass while WASM loads — apply gain so slider still works during load
-        if (!this.isReady) {
-            for (let i = 0; i < input.length; i++) {
-                outputChannels[0][i] = input[i] * this.gain;
-            }
-            if (outputChannels[1]) outputChannels[1].set(outputChannels[0]);
-            return true;
-        }
+        // Silent while the WASM loads (a few ms). The kernel fades in once ready.
+        if (!this.isReady) return true;
 
-        // reattach views if WASM memory grew
-        if (this.inputView.buffer !== this.instance.exports.memory.buffer) {
-            this.inputView = new Float32Array(this.instance.exports.memory.buffer, this.inPtr, 128);
-            this.outputView = new Float32Array(this.instance.exports.memory.buffer, this.outPtr, 128);
-        }
+        // Views go stale if WASM memory ever grows (not expected with static memory)
+        if (this.inputView.buffer !== this.exp.memory.buffer) this._attachViews();
 
-        // run WASM kernel (handles fade-in, any DSP you add later)
         this.inputView.set(input);
-        this.instance.exports.process_audio(
-            this.cppInstancePtr,
-            this.inPtr,
-            this.outPtr,
-            input.length
-        );
+        this.exp.process_audio(this.kernel, this.inputView.byteOffset,
+                               this.outputView.byteOffset, input.length);
 
-        // apply gain in JS after WASM — guaranteed to work
-        if (this.mode === 'passthrough' || this.mode === 'both') {
-            for (let i = 0; i < this.outputView.length; i++) {
-                outputChannels[0][i] = this.outputView[i] * this.gain;
-            }
-            if (outputChannels[1]) outputChannels[1].set(outputChannels[0]);
-        }
+        // The kernel already applied gain, so output and chunks always match.
+        out[0].set(this.outputView.subarray(0, input.length));
+        for (let ch = 1; ch < out.length; ch++) out[ch].set(out[0]);
 
         if (this.mode === 'accumulate' || this.mode === 'both') {
-            this._accumulate(this.outputView);
+            this._accumulate(this.outputView.subarray(0, input.length));
         }
 
         return true;
     }
 
     _accumulate(frame) {
-        const remaining = this.chunkSize - this.accumulatorIndex;
-
-        if (remaining >= 128) {
-            this.accumulator.set(frame, this.accumulatorIndex);
-            this.accumulatorIndex += 128;
-        } else {
-            const overflow = frame.subarray(remaining);
-            this.accumulator.set(frame.subarray(0, remaining), this.accumulatorIndex);
-            this.accumulatorIndex = this.chunkSize;
-            this._postChunk();
-            this.accumulator.set(overflow, 0);
-            this.accumulatorIndex = overflow.length;
-            return;
-        }
-
-        if (this.accumulatorIndex >= this.chunkSize) {
-            this._postChunk();
-            this.accumulatorIndex = 0;
+        let offset = 0;
+        while (offset < frame.length) {
+            const n = Math.min(frame.length - offset, this.chunkSize - this.accumulatorIndex);
+            this.accumulator.set(frame.subarray(offset, offset + n), this.accumulatorIndex);
+            this.accumulatorIndex += n;
+            offset += n;
+            if (this.accumulatorIndex === this.chunkSize) {
+                this._postChunk(this.chunkSize);
+                this.accumulatorIndex = 0;
+            }
         }
     }
 
-    _postChunk() {
-        const transfer = this.accumulator.buffer.slice(0);
-        this.port.postMessage({ type: 'chunk', audio: transfer });
-    }
-
-    disconnectedCallback() {
-        if (this.instance && this.cppInstancePtr) {
-            this.instance.exports.destroy_kernel(this.cppInstancePtr);
-        }
+    // Transfer (not copy) the filled buffer, then start a fresh one.
+    _postChunk(length) {
+        const full = this.accumulator;
+        this.accumulator = new Float32Array(this.chunkSize);
+        const audio = length === full.length ? full : full.slice(0, length);
+        this.port.postMessage({ type: 'chunk', audio: audio.buffer }, [audio.buffer]);
     }
 }
 

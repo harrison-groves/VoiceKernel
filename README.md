@@ -1,81 +1,89 @@
-VoiceKernel is an Emscripten-backed audio processing module designed for low-latency microphone capture and chunked data accumulation. It provides a high-level JavaScript interface to handle complex Web Audio and WebAssembly interactions.
+VoiceKernel is a low-latency microphone module for the browser. Audio runs through a C++ kernel compiled to WebAssembly inside an AudioWorklet, on the real-time audio thread. No Emscripten JS glue, Web Workers or SharedArrayBuffer are needed, so it works without cross-origin isolation (COOP/COEP) headers.
 
 -- Installation --
 
-Ensure the following files are located in your project directory:
+Copy these three files into your project, side by side:
 
     voice-kernel.js
-
-    Supporting Emscripten .wasm and .worker.js files
-
-    (all files in /dist)
+    worklet-processor.js
+    processor.wasm
 
 Due to browser security policies, VoiceKernel requires an HTTPS connection (or localhost) and a user interaction (like a click) to initialize the AudioContext.
 
 -- Basic Usage --
 
-import VoiceKernel from './voice-kernel.js';
+    import VoiceKernel from './voice-kernel.js';
 
-    async function initMic() {
-        try {
-            const mic = await VoiceKernel.create({
-                mode: 'passthrough',    // 'passthrough', 'accumulate', or 'both'
-                gain: 1.0,              // Input gain multiplier
-                chunkDuration: 250,      // Callback interval in milliseconds
-                onChunk: (samples) => {
-                    // samples is a Float32Array
-                    console.log("New audio chunk received:", samples);
-                }
-            });
-    
-            // Example: Update gain after 5 seconds
-            setTimeout(() => mic.setGain(0.5), 5000);
-    
-        } catch (error) {
-            console.error("Failed to initialize microphone:", error);
+    const mic = await VoiceKernel.create({
+        mode: 'accumulate',     // 'passthrough', 'accumulate', or 'both'
+        gain: 1.0,              // input gain multiplier
+        chunkDuration: 250,     // callback interval in milliseconds
+        monitor: false,         // play processed audio to speakers (use headphones!)
+        onChunk: (samples) => {
+            // samples is a Float32Array: feed to STT, upload, etc.
         }
-    }
+    });
+
+    // processed audio as a standard MediaStream
+    peerConnection.addTrack(mic.stream.getAudioTracks()[0], mic.stream);
+
+    console.log(`processing latency: ${mic.latencyMs.toFixed(2)} ms`);
 
 -- API Reference --
 
 Static Methods
 
-    VoiceKernel.create(options) // Initializes the microphone and returns a VoiceKernel instance.
+    VoiceKernel.create(options) // Starts the mic and resolves once the WASM kernel is running.
+                                // Rejects if mic access is denied or the kernel fails to load.
 
-    options.mode: String. Options: passthrough, accumulate, both.
+    options.mode: 'passthrough' | 'accumulate' | 'both'. Default 'passthrough'.
+    options.gain: Float. Default 1.0.
+    options.chunkDuration: Integer ms per onChunk callback. Default 250.
+    options.monitor: Boolean. Play processed audio to the speakers. Default false.
+    options.onChunk: Function(Float32Array). Called with each chunk in accumulate/both modes.
+    options.echoCancellation / noiseSuppression / autoGainControl:
+        Booleans passed to getUserMedia (the browser's built-in processing). Default false.
 
-    options.gain: Float. The volume multiplier.
+Instance Properties
 
-    options.chunkDuration: Integer. The duration of audio (ms) per chunk callback.
-
-    options.onChunk: Function. Called when a new buffer of samples is ready.
+    stream      // MediaStream of the processed audio (WebRTC, MediaRecorder, etc.)
+    latencyMs   // Latency added by VoiceKernel's processing (excludes browser I/O latency)
 
 Instance Methods
 
-    setGain(value) // Adjusts the input gain in real-time.
+    setGain(value)                // Smoothed in the kernel, so no clicks. 0.0 mutes, 1.0 is unity.
+    setMode(mode, chunkDuration)  // Change chunking without restarting.
+    setMonitor(on)                // Toggle speaker playback.
+    getAnalyser()                 // The native AnalyserNode, for waveforms or spectra.
+    destroy()                     // Stop the mic and release everything.
 
-    value: Float (e.g., 1.0 is original volume, 0.0 is muted).
-
-    setMode(mode, chunkDuration) // Changes the processing behavior without destroying the instance.
-
-    mode: String (passthrough, accumulate, both).
-
-    chunkDuration: Integer (ms).
-
-    getAnalyser() // Returns the native Web Audio AnalyserNode. Use this for generating waveforms or frequency data.
-
-    destroy() // Closes the microphone stream, stops the internal processing loop, and releases memory.
 Operational Modes
-Mode	Behavior	Use Case
-    
-    passthrough	Minimal processing latency.	Live monitoring and visualizers.
-    
-    accumulate	Collects samples into buffers of chunkDuration.	STT, recording, or server streaming.
-    
-    both	Simultaneous passthrough and accumulation.	Monitoring while recording.
 
-    Sample Rate: Defaults to the browser's hardware sample rate (usually 44.1kHz or 48kHz).
+    Mode         Behavior                                         Use Case
+    passthrough  Processed audio only (stream / monitor).         Calls, live monitoring, visualizers.
+    accumulate   Also collects samples into chunkDuration chunks.  STT, recording, server streaming.
+    both         Same as accumulate.                               Kept for compatibility.
 
-    Buffer Format: 32-bit Floating Point (Float32Array).
+    Gain is applied inside the kernel, so `stream`, the speakers and onChunk all receive the same audio.
 
-    Architecture: Uses an Emscripten-compiled core for high-performance DSP tasks.
+-- Architecture --
+
+    mic → AudioWorklet (128-sample blocks)
+            → C++ kernel: buffers into 480-sample frames (10 ms @ 48 kHz)
+              → processFrame()   ← DSP / noise suppression hook
+              → gain + fade-in
+          → stream / analyser / speakers / onChunk
+
+The frame buffer adds 448 samples (9.33 ms) of latency, the minimum that never
+underruns when adapting 128-sample blocks to 480-sample frames.
+
+    Sample Rate: 48 kHz.
+    Buffer Format: 32-bit float (Float32Array).
+
+-- Building --
+
+Requires Emscripten (emsdk):
+
+    make
+
+This produces processor.wasm from src/processor.cpp.
